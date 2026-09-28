@@ -353,6 +353,18 @@ describe('importPlan with an embedded model', () => {
     expect(Object.keys(stagedResults()).sort()).toEqual(['profiles', 'spans']);
   });
 
+  test('writes each profile with type and schema before segments, keeping segment order', async () => {
+    const transfer = structuredClone(v3Fixture);
+    const [name, { schema, segments, type }] = Object.entries(transfer.results!.profiles)[0];
+    transfer.results!.profiles[name] = { segments, schema, type } as never;
+
+    await runImport(transfer);
+
+    const staged = stagedResults().profiles[name];
+    expect(Object.keys(staged)).toEqual(['type', 'schema', 'segments']);
+    expect(staged.segments).toEqual(segments);
+  });
+
   test.each([
     ['a role without insert_plan_one', mutationRoot('insert_tags')],
     ['a role with no mutations at all', { data: { __type: null } }],

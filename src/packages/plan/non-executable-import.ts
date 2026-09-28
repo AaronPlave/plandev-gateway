@@ -262,7 +262,17 @@ export async function insertExternalSimulationDataset({
     results &&
     (await storeUploadedFile(
       'plan-transfer-results.json',
-      JSON.stringify({ profiles: results.profiles, spans: results.spans }),
+      JSON.stringify({
+        // merlin streams each profile once, so it needs `type` and `schema` before `segments`
+        profiles: Object.fromEntries(
+          Object.entries(results.profiles).map(([name, { type, schema, segments }]) => [
+            name,
+            // eslint-disable-next-line sort-keys -- key order is what merlin's parser needs
+            { type, schema, segments },
+          ]),
+        ),
+        spans: results.spans,
+      }),
     ));
 
   try {
