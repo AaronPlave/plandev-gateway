@@ -1,7 +1,7 @@
 import fetch from 'node-fetch';
 import type { HasuraError } from '../../types/hasura.js';
 import type { ModelDeclaration, SerializedValue, SimulationResultsTransfer } from '../../types/plan-transfer.js';
-import { generateJwt, getSessionVariables } from '../auth/functions.js';
+import { generateJwt } from '../auth/functions.js';
 import { removeUploadedFile, storeUploadedFile } from '../files/store.js';
 import { getEnv } from '../../env.js';
 import { intervalToMicroseconds, isoToDoyTimestamp } from '../../util/time.js';
@@ -72,16 +72,13 @@ async function postMerlin(endpoint: string, body: Record<string, unknown>): Prom
  * caller. Its types are registered asynchronously afterwards; see `waitForModelTypes`.
  *
  * Only admins may insert models through Hasura, so the insert uses a short-lived admin token. The caller must already
- * be known to be allowed to create plans, and since the admin role skips Hasura's column presets, the owner comes from
- * the caller's verified token rather than the request's `x-hasura-user-id` header.
+ * be known to be allowed to create plans, and since the admin role skips Hasura's column presets, `owner` must be the
+ * user from the caller's verified token rather than the request's `x-hasura-user-id` header.
  */
 export async function createNonExecutableModel(
   model: ModelDeclaration,
-  { name }: { name: string },
-  headers: Record<string, string>,
+  { name, owner }: { name: string; owner: string },
 ): Promise<number> {
-  // resolved first, so a bad token fails before anything is staged
-  const { 'x-hasura-user-id': owner } = getSessionVariables(headers.Authorization, headers['x-hasura-role']);
   const adminToken = generateJwt(owner, 'admin', ['admin'], '10s');
   if (adminToken === null) {
     throw new Error('Could not create a token to insert the non-executable model.');
@@ -205,6 +202,7 @@ export async function insertExternalSimulationDataset({
   planDuration,
   planId,
   planStartTime,
+  requester,
   results,
   simulationArguments,
 }: {
@@ -213,6 +211,8 @@ export async function insertExternalSimulationDataset({
   planId: number;
   /** ISO 8601, as on the plan. */
   planStartTime: string;
+  /** The user from the caller's verified token. */
+  requester: string;
   results: SimulationResultsTransfer | undefined;
   simulationArguments: Record<string, SerializedValue>;
 }): Promise<void> {
@@ -227,6 +227,7 @@ export async function insertExternalSimulationDataset({
     await postMerlin('insertExternalSimulationDataset', {
       planId,
       planStartTime: isoToDoyTimestamp(planStartTime),
+      requester,
       resultsFileId: resultsFile?.id ?? null,
       simulationArguments,
       // results either carry their own window or inherit the plan's

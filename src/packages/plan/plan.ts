@@ -7,6 +7,7 @@ import { unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { Readable } from 'stream';
 
+import { getSessionVariables } from '../auth/functions.js';
 import { auth } from '../auth/middleware.js';
 import { parseJSONFile } from '../../util/fileParser.js';
 import { convertDateToDoy, getTimeDifference } from '../../util/time.js';
@@ -389,13 +390,15 @@ async function importSelfContainedPlan(
   headers: Record<string, string>,
   created: ImportedRecords,
 ): Promise<CreatedPlan> {
-  // 1. Refuse a caller who can't create plans, or a taken name, before creating anything.
+  // 1. Refuse a caller who can't create plans, or a taken name, before creating anything. Merlin and the admin-token
+  // model insert trust the requester they are given, so it comes from the verified token, not `x-hasura-user-id`.
+  const { 'x-hasura-user-id': requester } = getSessionVariables(headers.Authorization, headers['x-hasura-role']);
   await assertCanCreatePlan(headers);
   await assertPlanNameAvailable(name, headers);
 
   // 2. Create the non-executable model; merlin then registers its types asynchronously.
   logger.info(`POST /importPlan: Creating non-executable model: ${name}`);
-  const modelId = await createNonExecutableModel(model, { name }, headers);
+  const modelId = await createNonExecutableModel(model, { name, owner: requester });
   created.modelId = modelId;
 
   // 3. Wait for the types while building the plan, which needs only the model row.
@@ -434,6 +437,7 @@ async function importSelfContainedPlan(
     planDuration: transfer.duration,
     planId: plan.id,
     planStartTime: transfer.start_time,
+    requester,
     results,
     simulationArguments: transfer.simulation_arguments,
   });

@@ -266,6 +266,7 @@ describe('importPlan with an embedded model', () => {
     expect(callsTo('InsertExternalSimulationDataset')[0].variables).toEqual({
       planId: PLAN_ID,
       planStartTime: '2030-001T00:00:00',
+      requester: 'importer',
       resultsFileId: null,
       simulationArguments: v3Fixture.simulation_arguments,
       simulationDuration: 86_400_000_000,
@@ -299,6 +300,7 @@ describe('importPlan with an embedded model', () => {
     expect(callsTo('InsertExternalSimulationDataset')[0].variables).toEqual({
       planId: PLAN_ID,
       planStartTime: '2030-001T00:00:00',
+      requester: 'importer',
       resultsFileId: RESULTS_FILE.id,
       simulationArguments: v3Fixture.simulation_arguments,
       simulationDuration: 86_400_000_000,
@@ -457,10 +459,11 @@ describe('importPlan calling the backend', () => {
     expect(callsTo('CreatePlan')[0].headers?.Authorization).toBe(`Bearer ${token}`);
   });
 
-  test("takes the model's owner from the token, not the request's x-hasura-user-id header", async () => {
+  test("takes the model's owner and the results' requester from the token, not the x-hasura-user-id header", async () => {
     await runImport(v3Fixture, form, { 'x-hasura-role': 'user', 'x-hasura-user-id': 'someone-else' });
 
     expect(callsTo('InsertNonExecutableModel')[0].variables).toMatchObject({ owner: 'importer' });
+    expect(callsTo('InsertExternalSimulationDataset')[0].variables).toMatchObject({ requester: 'importer' });
   });
 
   test("accepts the token's default role when the request names none", async () => {
@@ -475,8 +478,7 @@ describe('importPlan calling the backend', () => {
 
     expect(error).toBe('Role "aerie_admin" is not in the allowed roles.');
     expect(storeUploadedFile).not.toHaveBeenCalled();
-    expect(callsTo('InsertNonExecutableModel')).toHaveLength(0);
-    expect(callsTo('CreatePlan')).toHaveLength(0);
+    expect(operations()).toEqual([]);
   });
 });
 
