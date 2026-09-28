@@ -4,6 +4,7 @@ import type { ModelDeclaration, SerializedValue, SimulationResultsTransfer } fro
 import { generateJwt } from '../auth/functions.js';
 import { removeUploadedFile, storeUploadedFile } from '../files/store.js';
 import { getEnv } from '../../env.js';
+import getLogger from '../../logger.js';
 import { intervalToMicroseconds, isoToDoyTimestamp } from '../../util/time.js';
 import gql from './gql.js';
 
@@ -15,6 +16,8 @@ import gql from './gql.js';
  * who the caller is, and asks for the plan to be made read-only once it has finished writing to it. How each payload
  * reaches the backend is kept inside these helpers so it can change without touching `/importPlan`.
  */
+
+const logger = getLogger('packages/plan/non-executable-import');
 
 const { HASURA_API_URL, PLANDEV_MERLIN_URL } = getEnv();
 
@@ -67,23 +70,38 @@ async function postMerlin(endpoint: string, body: Record<string, unknown>): Prom
   return text;
 }
 
+/** A non-executable model an import created, with what is needed to delete it again. */
+export type CreatedNonExecutableModel = {
+  definitionFile: { id: number; name: string };
+  id: number;
+  owner: string;
+};
+
+/**
+ * Headers for a short-lived admin token acting as `user`. Only admins may insert or delete models through Hasura; the
+ * caller must already be known to be allowed to create plans.
+ */
+function adminHeaders(user: string): Record<string, string> {
+  const adminToken = generateJwt(user, 'admin', ['admin'], '10s');
+  if (adminToken === null) {
+    throw new Error('Could not create a token to manage the non-executable model.');
+  }
+
+  return { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json', 'x-hasura-role': 'admin' };
+}
+
 /**
  * Stages the model declaration as a JSON definition file and inserts a non-executable model for it, owned by the
  * caller. Its types are registered asynchronously afterwards; see `waitForModelTypes`.
  *
- * Only admins may insert models through Hasura, so the insert uses a short-lived admin token. The caller must already
- * be known to be allowed to create plans, and since the admin role skips Hasura's column presets, `owner` must be the
- * user from the caller's verified token rather than the request's `x-hasura-user-id` header.
+ * The insert uses a short-lived admin token (see `adminHeaders`). Since the admin role skips Hasura's column presets,
+ * `owner` must be the user from the caller's verified token rather than the request's `x-hasura-user-id` header.
  */
 export async function createNonExecutableModel(
   model: ModelDeclaration,
   { name, owner }: { name: string; owner: string },
-): Promise<number> {
-  const adminToken = generateJwt(owner, 'admin', ['admin'], '10s');
-  if (adminToken === null) {
-    throw new Error('Could not create a token to insert the non-executable model.');
-  }
-
+): Promise<CreatedNonExecutableModel> {
+  const headers = adminHeaders(owner);
   const definitionFile = await storeUploadedFile('plan-transfer-model.json', JSON.stringify(model));
 
   try {
@@ -100,17 +118,41 @@ export async function createNonExecutableModel(
         // unique for the (mission, name, version) key, and tells the user when it was imported
         version: new Date().toISOString(),
       },
-      { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json', 'x-hasura-role': 'admin' },
+      headers,
     );
     if (inserted == null) {
       throw new Error('Non-executable model creation returned no model id.');
     }
 
-    return inserted.id;
+    return { definitionFile, id: inserted.id, owner };
   } catch (error) {
     await removeUploadedFile(definitionFile);
     throw error;
   }
+}
+
+/**
+ * Deletes a non-executable model a failed import created, and then its definition file. The database only removes a
+ * plan's non-executable model when a read-only plan is deleted, and a failed import never got as far as marking its
+ * plan read-only, so the import has to clean up the model itself. Delete the plan first: deleting the model would
+ * otherwise leave the plan with no model.
+ *
+ * Best-effort, since it runs while handling another failure: problems are logged, never thrown.
+ */
+export async function deleteNonExecutableModel({
+  definitionFile,
+  id,
+  owner,
+}: CreatedNonExecutableModel): Promise<void> {
+  try {
+    await postGraphQL(gql.DELETE_MISSION_MODEL, { id }, adminHeaders(owner));
+  } catch (error) {
+    // the model still references its definition file, so the file stays too
+    logger.error(`Could not delete non-executable model ${id}: ${(error as Error).message}`);
+    return;
+  }
+
+  await removeUploadedFile(definitionFile);
 }
 
 function describeNonExecutableModel({ activity_types, resource_types }: ModelDeclaration, planName: string): string {

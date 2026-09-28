@@ -72,6 +72,13 @@ export default {
       }
     }
   `,
+  DELETE_MISSION_MODEL: `#graphql
+    mutation DeleteMissionModel($id: Int!) {
+      delete_mission_model_by_pk(id: $id) {
+        id
+      }
+    }
+  `,
   DELETE_PLAN: `#graphql
     mutation DeletePlan($id: Int!) {
       deletePlan: delete_plan_by_pk(id: $id) {

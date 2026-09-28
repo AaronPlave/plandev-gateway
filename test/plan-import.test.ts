@@ -574,6 +574,72 @@ describe('importPlan waiting for model types', () => {
   });
 });
 
+describe('importPlan rolling back the model', () => {
+  // a failed import's plan is never read-only, so the database won't remove the model with it
+  test('deletes the model and its definition file after the plan', async () => {
+    responders.MarkPlanReadOnly = () => merlinError('plan cannot be marked read only');
+
+    const { error } = await runImport(v3Fixture);
+
+    expect(error).toBe('plan cannot be marked read only');
+    expect(operations().slice(-4)).toEqual(['DeletePlan', 'DeleteTags', 'DeleteMissionModel', 'removeUploadedFile']);
+    const [deleteModel] = callsTo('DeleteMissionModel');
+    expect(deleteModel.variables).toEqual({ id: MODEL_ID });
+    expect(deleteModel.headers?.['x-hasura-role']).toBe('admin');
+    expect(decodeJwt(deleteModel.headers?.Authorization).jwtPayload?.username).toBe('importer');
+    expect(callsTo('removeUploadedFile').at(-1)?.variables).toEqual(MODEL_FILE);
+  });
+
+  test('deletes the model when the plan was never created', async () => {
+    responders.CreatePlan = () => ({ errors: [{ message: 'Uniqueness violation' }] });
+
+    const { error } = await runImport(v3Fixture);
+
+    expect(error).toBe('Plan creation unsuccessful.');
+    expect(callsTo('DeletePlan')).toHaveLength(0);
+    expect(callsTo('DeleteMissionModel')[0].variables).toEqual({ id: MODEL_ID });
+    expect(removeUploadedFile).toHaveBeenCalledWith(MODEL_FILE);
+  });
+
+  test('keeps the model when its plan could not be deleted', async () => {
+    responders.MarkPlanReadOnly = () => merlinError('plan cannot be marked read only');
+    responders.DeletePlan = () => ({ errors: [{ message: 'database unavailable' }] });
+
+    const { error } = await runImport(v3Fixture);
+
+    expect(error).toBe('plan cannot be marked read only');
+    expect(callsTo('DeleteMissionModel')).toHaveLength(0);
+    expect(removeUploadedFile).not.toHaveBeenCalledWith(MODEL_FILE);
+  });
+
+  test('keeps the definition file when the model could not be deleted, and still returns the original error', async () => {
+    responders.MarkPlanReadOnly = () => merlinError('plan cannot be marked read only');
+    responders.DeleteMissionModel = () => ({ errors: [{ message: 'database unavailable' }] });
+
+    const { error } = await runImport(v3Fixture);
+
+    expect(error).toBe('plan cannot be marked read only');
+    expect(callsTo('DeleteMissionModel')).toHaveLength(1);
+    expect(removeUploadedFile).not.toHaveBeenCalledWith(MODEL_FILE);
+  });
+
+  test('has nothing to delete when the model was never created', async () => {
+    responders.InsertNonExecutableModel = () => ({ errors: [{ message: 'model declaration rejected' }] });
+
+    await runImport(v3Fixture);
+
+    expect(callsTo('DeleteMissionModel')).toHaveLength(0);
+  });
+
+  test('leaves the model alone on a plan-only import', async () => {
+    responders.CreatePlan = () => ({ errors: [{ message: 'Uniqueness violation' }] });
+
+    await runImport(v3PlanOnly);
+
+    expect(callsTo('DeleteMissionModel')).toHaveLength(0);
+  });
+});
+
 describe('importPlan upload', () => {
   test('reads a disk-backed plan file and removes it afterwards', async () => {
     const path = join(tmpdir(), `plan-import-test-${Date.now()}.json`);

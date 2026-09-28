@@ -32,7 +32,9 @@ import {
 } from '../../types/dataset.js';
 import { parsePlanTransfer, remapResultDirectiveIds } from './plan-transfer.js';
 import {
+  type CreatedNonExecutableModel,
   createNonExecutableModel,
+  deleteNonExecutableModel,
   insertExternalSimulationDataset,
   markPlanReadOnly,
   postGraphQL,
@@ -264,7 +266,7 @@ async function remapAnchors(
 
 /** What an import has persisted so far, so a failed import can be cleaned up. */
 type ImportedRecords = {
-  modelId: number | null;
+  model: CreatedNonExecutableModel | null;
   plan: CreatedPlan | null;
   tags: Tag[];
 };
@@ -398,8 +400,8 @@ async function importSelfContainedPlan(
 
   // 2. Create the non-executable model; merlin then registers its types asynchronously.
   logger.info(`POST /importPlan: Creating non-executable model: ${name}`);
-  const modelId = await createNonExecutableModel(model, { name, owner: requester });
-  created.modelId = modelId;
+  created.model = await createNonExecutableModel(model, { name, owner: requester });
+  const modelId = created.model.id;
 
   // 3. Wait for the types while building the plan, which needs only the model row.
   const stopWaiting = new AbortController();
@@ -468,7 +470,7 @@ export async function importPlan(req: Request, res: Response) {
     'x-hasura-user-id': userHeader ? `${userHeader}` : '',
   };
 
-  const created: ImportedRecords = { modelId: null, plan: null, tags: [] };
+  const created: ImportedRecords = { model: null, plan: null, tags: [] };
 
   try {
     // 1. Parse the file and migrate it to PlanTransfer v3.
@@ -507,17 +509,15 @@ export async function importPlan(req: Request, res: Response) {
     logger.error(error);
 
     // cleanup the imported plan if it failed along the way
-    if (created.modelId !== null && created.plan === null) {
-      // Deleting the plan is what cleans up its model, and there is no plan.
-      logger.error(`POST /importPlan: Non-executable model ${created.modelId} was left without a plan`);
-    }
+    let planRemoved = true;
     if (created.plan) {
       // delete the plan - activities associated to the plan will be automatically cleaned up
-      await fetch(GQL_API_URL, {
-        body: JSON.stringify({ query: gql.DELETE_PLAN, variables: { id: created.plan.id } }),
-        headers,
-        method: 'POST',
-      });
+      try {
+        await postGraphQL(gql.DELETE_PLAN, { id: created.plan.id }, headers);
+      } catch (cleanupError) {
+        planRemoved = false;
+        logger.error(`POST /importPlan: Could not delete plan ${created.plan.id}: ${(cleanupError as Error).message}`);
+      }
 
       // if any activity tags were created as a result of this import, remove them
       await fetch(GQL_API_URL, {
@@ -525,6 +525,14 @@ export async function importPlan(req: Request, res: Response) {
         headers,
         method: 'POST',
       });
+    }
+    // a failed import's plan was never marked read-only, so the database won't remove its model
+    if (created.model) {
+      if (planRemoved) {
+        await deleteNonExecutableModel(created.model);
+      } else {
+        logger.error(`POST /importPlan: Kept non-executable model ${created.model.id}, since its plan is still there`);
+      }
     }
     res.status(500);
     res.send((error as Error).message);
