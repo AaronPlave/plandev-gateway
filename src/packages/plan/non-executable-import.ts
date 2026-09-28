@@ -177,14 +177,7 @@ type ModelTypeRefreshStatus = {
 };
 
 /**
- * Waits until merlin has registered a new model's activity types, resource types and parameters. Inserting the
- * model fires the `refreshActivityTypes`, `refreshResourceTypes` and `refreshModelParameters` event triggers, and
- * each writes one row to its log view: not there yet or `pending` means keep waiting, and since the triggers use
- * `num_retries: 0`, the first finished row is final.
- *
- * The log views read `hdb_catalog.event_log`. The rows read here are only seconds old, so this stays safe even if
- * Hasura's event-log cleanup is turned on later.
- *
+ * Waits until merlin has registered a new model's activity types, resource types and parameters.
  * Stops polling once `signal` is aborted.
  */
 export async function waitForModelTypes(
