@@ -415,3 +415,12 @@ describe('PlanTransfer span rules', () => {
     expect(() => parsePlanTransfer(withSpans(...spans))).toThrow(message);
   });
 });
+
+describe('PlanTransfer activity rules', () => {
+  test('refuses duplicate activity ids before import', () => {
+    const activity = plainPlan.activities[0];
+    expect(() =>
+      parsePlanTransfer({ ...plainPlan, activities: [activity, { ...activity, name: 'duplicate' }] }),
+    ).toThrow('Activity id 1 is used more than once.');
+  });
+});

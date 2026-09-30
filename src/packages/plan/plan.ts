@@ -33,6 +33,8 @@ import {
 import { parsePlanTransfer, remapResultDirectiveIds } from './plan-transfer.js';
 import {
   type CreatedNonExecutableModel,
+  adminHeaders,
+  backgroundHeaders,
   createNonExecutableModel,
   createPlanImportRequest,
   deleteNonExecutableModel,
@@ -66,101 +68,48 @@ const refreshLimiter = rateLimit({
 
 const timeColumnKey = 'time_utc';
 
+type Headers = Record<string, string> | (() => Record<string, string>);
+const resolveHeaders = (headers: Headers) => (typeof headers === 'function' ? headers() : headers);
+
 async function createActivities(
   activities: ActivityDirectiveInsertInput[],
   activitiesJSON: ActivityDirectiveTransfer[],
   planId: number,
-  headers: Record<string, string>,
+  headers: Headers,
 ): Promise<Record<number, number>> {
   const activityRemap: Record<number, number> = {};
 
-  const createdActivitiesResponse = await fetch(GQL_API_URL, {
-    body: JSON.stringify({
-      query: gql.CREATE_ACTIVITY_DIRECTIVES,
-      variables: {
-        activityDirectivesInsertInput: activities,
-      },
-    }),
-    headers,
-    method: 'POST',
+  const { insert_activity_directive: inserted } = await postGraphQL<{
+    insert_activity_directive: { returning: ActivityDirective[] };
+  }>(gql.CREATE_ACTIVITY_DIRECTIVES, { activityDirectivesInsertInput: activities }, resolveHeaders(headers));
+  const createdActivities = inserted.returning;
+  if (createdActivities.length !== activities.length) {
+    throw new Error(`Activity insertion created ${createdActivities.length} of ${activities.length} activities.`);
+  }
+  createdActivities.forEach((createdActivity, index) => {
+    activityRemap[activitiesJSON[index].id] = createdActivity.id;
   });
 
-  const createdActivityDirectivesData = (await createdActivitiesResponse.json()) as {
-    data: {
-      insert_activity_directive: {
-        returning: ActivityDirective[];
-      };
-    };
-  } | null;
-
-  if (createdActivityDirectivesData) {
-    const {
-      data: {
-        insert_activity_directive: { returning: createdActivityDirectives },
-      },
-    } = createdActivityDirectivesData;
-
-    if (createdActivityDirectives.length === activities.length) {
-      createdActivityDirectives.forEach((createdActivityDirective, index) => {
-        const { id } = activitiesJSON[index];
-
-        activityRemap[id] = createdActivityDirective.id;
-      });
-    } else {
-      throw new Error('Activity insertion failed.');
-    }
-    // remap all the anchor ids to the newly created activity directives
-    logger.info(`POST /uploadActivities: Re-assigning anchors`);
-
-    const activityDirectivesSetInput = await remapAnchors(activitiesJSON, activityRemap, planId);
-
-    await fetch(GQL_API_URL, {
-      body: JSON.stringify({
-        query: gql.UPDATE_ACTIVITY_DIRECTIVES,
-        variables: {
-          updates: activityDirectivesSetInput,
-        },
-      }),
-      headers,
-      method: 'POST',
-    });
-
-    return activityRemap;
+  logger.info(`POST /uploadActivities: Re-assigning anchors`);
+  const updates = await remapAnchors(activitiesJSON, activityRemap, planId);
+  const { update_activity_directive_many: updated } = await postGraphQL<{
+    update_activity_directive_many: { affected_rows: number }[];
+  }>(gql.UPDATE_ACTIVITY_DIRECTIVES, { updates }, resolveHeaders(headers));
+  if (updated.length !== updates.length || updated.some(({ affected_rows }) => affected_rows !== 1)) {
+    throw new Error('Not all activity anchors were updated.');
   }
-  return {};
+
+  return activityRemap;
 }
 
 async function createTags(
   activities: ActivityDirectiveTransfer[],
-  headers: Record<string, string>,
+  headers: Headers,
 ): Promise<{ createdTags: Tag[]; tagsMap: Record<string, Tag> }> {
   let createdTags: Tag[] = [];
-  const tagsResponse = await fetch(GQL_API_URL, {
-    body: JSON.stringify({
-      query: gql.GET_TAGS,
-    }),
-    headers,
-    method: 'POST',
-  });
-
-  const tagsResponseJSON = (await tagsResponse.json()) as {
-    data: {
-      tags: Tag[];
-    };
-  };
-
+  const { tags } = await postGraphQL<{ tags: Tag[] }>(gql.GET_TAGS, {}, resolveHeaders(headers));
   let tagsMap: Record<string, Tag> = {};
-  if (tagsResponseJSON != null && tagsResponseJSON.data != null) {
-    const {
-      data: { tags },
-    } = tagsResponseJSON;
-    tagsMap = tags.reduce((prevTagsMap: Record<string, Tag>, tag) => {
-      return {
-        ...prevTagsMap,
-        [tag.name]: tag,
-      };
-    }, {});
-  }
+  tagsMap = tags.reduce((prevTagsMap: Record<string, Tag>, tag) => ({ ...prevTagsMap, [tag.name]: tag }), {});
 
   // derive a map of uniquely named tags from the list of activities that doesn't already exist in the database
   const activityTags = activities.reduce(
@@ -188,25 +137,16 @@ async function createTags(
     {},
   );
 
-  const createdTagsResponse = await fetch(GQL_API_URL, {
-    body: JSON.stringify({
-      query: gql.CREATE_TAGS,
-      variables: { tags: Object.values(activityTags) },
-    }),
-    headers,
-    method: 'POST',
-  });
-
-  const { data } = (await createdTagsResponse.json()) as {
-    data: {
-      insert_tags: { returning: Tag[] };
-    };
-  };
-
-  if (data && data.insert_tags && data.insert_tags.returning.length) {
-    // track the newly created tags for cleanup if an error occurs during plan import
-    createdTags = data.insert_tags.returning;
+  const missingTags = Object.values(activityTags);
+  const { insert_tags: inserted } = await postGraphQL<{ insert_tags: { returning: Tag[] } }>(
+    gql.CREATE_TAGS,
+    { tags: missingTags },
+    resolveHeaders(headers),
+  );
+  if (inserted.returning.length !== missingTags.length) {
+    throw new Error(`Tag insertion created ${inserted.returning.length} of ${missingTags.length} tags.`);
   }
+  createdTags = inserted.returning;
 
   // add the newly created tags to the `tagsMap`
   tagsMap = createdTags.reduce(
@@ -270,6 +210,8 @@ async function remapAnchors(
 type ImportedRecords = {
   model: CreatedNonExecutableModel | null;
   plan: CreatedPlan | null;
+  /** The user from the caller's verified token, known before anything is created. */
+  requester: string | null;
   tags: Tag[];
 };
 
@@ -288,19 +230,11 @@ async function createPlan(
   created: ImportedRecords,
 ): Promise<CreatedPlan> {
   logger.info(`POST /importPlan: Creating new plan: ${planInsertInput.name}`);
-  const planCreationResponse = await fetch(GQL_API_URL, {
-    body: JSON.stringify({ query: gql.CREATE_PLAN, variables: { plan: planInsertInput } }),
+  const { createPlan: createdPlan } = await postGraphQL<{ createPlan: CreatedPlan | null }>(
+    gql.CREATE_PLAN,
+    { plan: planInsertInput },
     headers,
-    method: 'POST',
-  });
-
-  const planCreationResponseJSON = (await planCreationResponse.json()) as {
-    data: {
-      createPlan: CreatedPlan | null;
-    };
-  };
-
-  const createdPlan = planCreationResponseJSON?.data?.createPlan;
+  );
   if (createdPlan == null) {
     throw Error('Plan creation unsuccessful.');
   }
@@ -316,7 +250,7 @@ async function createPlan(
 async function fillPlan(
   plan: CreatedPlan,
   { activities, planTags, simulationArguments, simulationTemplateId }: PlanContents,
-  headers: Record<string, string>,
+  headers: Headers,
   created: ImportedRecords,
 ): Promise<Record<number, number>> {
   // 1. Set its simulation arguments.
@@ -326,14 +260,12 @@ async function fillPlan(
     simulation_template_id: simulationTemplateId,
   };
 
-  await fetch(GQL_API_URL, {
-    body: JSON.stringify({
-      query: gql.UPDATE_SIMULATION,
-      variables: { plan_id: plan.id, simulation: simulationInput },
-    }),
-    headers,
-    method: 'POST',
-  });
+  const { update_simulation: updatedSimulation } = await postGraphQL<{
+    update_simulation: { returning: { id: number }[] };
+  }>(gql.UPDATE_SIMULATION, { plan_id: plan.id, simulation: simulationInput }, resolveHeaders(headers));
+  if (updatedSimulation.returning.length === 0) {
+    throw new Error(`No simulation was updated for plan ${plan.id}.`);
+  }
 
   // 2. Create missing activity tags, then the activities, then re-link their anchors.
   logger.info(`POST /importPlan: Importing activities: plan ${plan.id}`);
@@ -354,11 +286,12 @@ async function fillPlan(
     tag_id: tagId,
   }));
 
-  await fetch(GQL_API_URL, {
-    body: JSON.stringify({ query: gql.CREATE_PLAN_TAGS, variables: { tags: tagsInsert } }),
-    headers,
-    method: 'POST',
-  });
+  const { insert_plan_tags: insertedPlanTags } = await postGraphQL<{
+    insert_plan_tags: { affected_rows: number };
+  }>(gql.CREATE_PLAN_TAGS, { tags: tagsInsert }, resolveHeaders(headers));
+  if (insertedPlanTags.affected_rows !== tagsInsert.length) {
+    throw new Error(`Plan tag insertion created ${insertedPlanTags.affected_rows} of ${tagsInsert.length} links.`);
+  }
 
   return activityIdMap;
 }
@@ -366,19 +299,35 @@ async function fillPlan(
 /**
  * Deletes what a failed import created: the plan (its activities go with it), the activity tags it created, and the
  * non-executable model, which is kept if its plan could not be deleted. Best-effort: problems are logged, never thrown.
+ *
+ * Runs as a short-lived admin token for the requester, so a caller's token that expired during a long import can
+ * still be cleaned up after. Only rows this import created, by id, are deleted.
  */
-async function rollBackImport(created: ImportedRecords, headers: Record<string, string>): Promise<void> {
+async function rollBackImport(created: ImportedRecords): Promise<void> {
+  // nothing is created before the requester is known
+  if (created.requester === null) {
+    return;
+  }
+
   let planRemoved = true;
   if (created.plan) {
     try {
-      await postGraphQL(gql.DELETE_PLAN, { id: created.plan.id }, headers);
+      const { deletePlan } = await postGraphQL<{ deletePlan: { id: number } | null }>(
+        gql.DELETE_PLAN,
+        { id: created.plan.id },
+        adminHeaders(created.requester),
+      );
+      if (deletePlan?.id !== created.plan.id) {
+        throw new Error('Delete returned no plan.');
+      }
     } catch (cleanupError) {
       planRemoved = false;
       logger.error(`POST /importPlan: Could not delete plan ${created.plan.id}: ${(cleanupError as Error).message}`);
     }
 
     try {
-      await postGraphQL(gql.DELETE_TAGS, { tagIds: created.tags.map(({ id }) => id) }, headers);
+      const tagIds = created.tags.map(({ id }) => id);
+      await postGraphQL(gql.DELETE_TAGS, { tagIds }, adminHeaders(created.requester));
     } catch (cleanupError) {
       logger.error(`POST /importPlan: Could not delete the import's tags: ${(cleanupError as Error).message}`);
     }
@@ -425,6 +374,7 @@ type StartedImport = {
   plan: CreatedPlan;
   requestId: number;
   requester: string;
+  role: string;
   /** Whether the file embeds its model, which then is new, non-executable and needs its types registered. */
   selfContained: boolean;
   simulationTemplateId?: number;
@@ -446,7 +396,11 @@ async function startImport(
 ): Promise<StartedImport> {
   // The admin-token model insert and merlin trust the requester they are given, so it comes from the verified token,
   // not `x-hasura-user-id`.
-  const { 'x-hasura-user-id': requester } = getSessionVariables(headers.Authorization, headers['x-hasura-role']);
+  const { 'x-hasura-role': role, 'x-hasura-user-id': requester } = getSessionVariables(
+    headers.Authorization,
+    headers['x-hasura-role'],
+  );
+  created.requester = requester;
   const { model } = transfer;
 
   if (model === undefined) {
@@ -466,6 +420,7 @@ async function startImport(
       plan,
       requestId,
       requester,
+      role,
       selfContained: false,
       simulationTemplateId: simulation_template_id,
       transfer,
@@ -489,7 +444,7 @@ async function startImport(
   );
   const requestId = await createPlanImportRequest({ modelId, planId: plan.id, requester, status: 'extracting_model' });
 
-  return { created, modelId, plan, requestId, requester, selfContained: true, transfer };
+  return { created, modelId, plan, requestId, requester, role, selfContained: true, transfer };
 }
 
 /**
@@ -499,14 +454,14 @@ async function startImport(
  * reason. Never throws.
  */
 async function finishImport(
-  { created, modelId, plan, requestId, requester, selfContained, simulationTemplateId, transfer }: StartedImport,
+  { created, modelId, plan, requestId, requester, role, selfContained, simulationTemplateId, transfer }: StartedImport,
   planTags: string,
-  headers: Record<string, string>,
 ): Promise<void> {
+  const getHeaders = () => backgroundHeaders(requester, role);
   try {
     if (selfContained) {
       logger.info(`POST /importPlan: Waiting for model types to be registered: request ${requestId}`);
-      await waitForModelTypes(modelId, headers);
+      await waitForModelTypes(modelId, getHeaders);
       await setPlanImportRequestStatus(requestId, 'importing_plan');
     }
 
@@ -518,7 +473,7 @@ async function finishImport(
         simulationArguments: transfer.simulation_arguments,
         simulationTemplateId,
       },
-      headers,
+      getHeaders,
       created,
     );
 
@@ -553,7 +508,7 @@ async function finishImport(
     await setPlanImportRequestStatus(requestId, 'failed', { message: (error as Error).message }).catch(statusError =>
       logger.error(`POST /importPlan: Could not mark import request ${requestId} failed: ${statusError}`),
     );
-    await rollBackImport(created, headers);
+    await rollBackImport(created);
   }
 }
 
@@ -576,7 +531,7 @@ export async function importPlan(req: Request, res: Response) {
     'x-hasura-user-id': userHeader ? `${userHeader}` : '',
   };
 
-  const created: ImportedRecords = { model: null, plan: null, tags: [] };
+  const created: ImportedRecords = { model: null, plan: null, requester: null, tags: [] };
 
   try {
     // 1. Parse the file and migrate it to PlanTransfer v3.
@@ -590,12 +545,12 @@ export async function importPlan(req: Request, res: Response) {
     res.json({ model_id: started.modelId, plan_id: started.plan.id, plan_import_request_id: started.requestId });
 
     // 3. Finish in the background; awaited only so the temporary upload is removed afterwards.
-    await finishImport(started, payload.tags, headers);
+    await finishImport(started, payload.tags);
   } catch (error) {
     logger.error(`POST /importPlan: Error occurred during plan ${payload.name} import`);
     logger.error(error);
 
-    await rollBackImport(created, headers);
+    await rollBackImport(created);
     res.status(500);
     res.send((error as Error).message);
   } finally {

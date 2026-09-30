@@ -1,11 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import {
-  convertDateToDoy,
-  getTimeDifference,
-  intervalToMicroseconds,
-  isoToDoyTimestamp,
-  parseDoyOrYmdTime,
-} from './time';
+import { convertDateToDoy, getTimeDifference, isoToDoyTimestamp, parseDoyOrYmdTime } from './time';
 
 describe('Time utility function tests', () => {
   test('parseDoyOrYmdTime', () => {
@@ -73,14 +67,5 @@ describe('isoToDoyTimestamp', () => {
 
   test('refuses anything else', () => {
     expect(() => isoToDoyTimestamp('yesterday')).toThrow('Invalid date-time: yesterday');
-  });
-});
-
-describe('intervalToMicroseconds', () => {
-  test('converts plan durations, including hours past a day and single microseconds', () => {
-    expect(intervalToMicroseconds('24:00:00')).toBe(86_400_000_000);
-    expect(intervalToMicroseconds('1008:00:00')).toBe(6 * 7 * 24 * 3_600_000_000);
-    expect(intervalToMicroseconds('1 day 02:00:00')).toBe(26 * 3_600_000_000);
-    expect(intervalToMicroseconds('00:00:00.000001')).toBe(1);
   });
 });

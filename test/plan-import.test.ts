@@ -62,6 +62,7 @@ const defaultResponders: Record<string, Responder> = {
     },
   }),
   CreatePlan: ({ plan }) => ({ data: { createPlan: { ...plan, id: PLAN_ID } } }),
+  CreatePlanTags: ({ tags }) => ({ data: { insert_plan_tags: { affected_rows: tags.length } } }),
   CreateTags: ({ tags }) => ({
     data: {
       insert_tags: { returning: tags.map((tag: object, index: number) => ({ ...tag, id: FIRST_TAG_ID + index })) },
@@ -70,6 +71,7 @@ const defaultResponders: Record<string, Responder> = {
   GetPlanByName: () => ({ data: { plan: [] } }),
   MutationRootFields: () => mutationRoot('insert_activity_directive', 'insert_plan_one', 'insert_tags'),
   GetTags: () => ({ data: { tags: [] } }),
+  InitialSimulationUpdate: () => ({ data: { update_simulation: { returning: [{ id: 1 }] } } }),
   InsertNonExecutableModel: () => ({ data: { insert_mission_model_one: { id: MODEL_ID } } }),
   ModelTypeRefreshStatus: () => refreshStatus(succeeded, succeeded, succeeded),
   // merlin marks the request complete once it has ingested the results
@@ -78,6 +80,12 @@ const defaultResponders: Record<string, Responder> = {
     return { text: '' };
   },
   MarkPlanReadOnly: () => ({ text: '' }),
+  UpdateActivityDirective: ({ updates }) => ({
+    data: { update_activity_directive_many: updates.map(() => ({ affected_rows: 1 })) },
+  }),
+  DeleteMissionModel: ({ id }) => ({ data: { delete_mission_model_by_pk: { id } } }),
+  DeletePlan: ({ id }) => ({ data: { deletePlan: { id } } }),
+  DeleteTags: ({ tagIds }) => ({ data: { delete_tags: { affected_rows: tagIds.length } } }),
 };
 
 /** What Hasura's introspection shows a role that may run these mutations. */
@@ -121,6 +129,15 @@ let importRequests: Record<number, ImportRequest>;
 
 /** The fake database's answer to the gateway's plan_import_request queries, recorded like the other calls. */
 async function dbQuery(sql: string, params: any[]) {
+  if (sql.includes('extract(epoch from $1::interval)')) {
+    const durations: Record<string, string> = {
+      '24:00:00': '86400000000',
+      P1D: '86400000000',
+      '1 month': '2592000000000',
+      '1 year': '31557600000000',
+    };
+    return { rows: [{ microseconds: durations[params[0]] }] };
+  }
   if (sql.includes('insert into merlin.plan_import_request')) {
     const [requester, status, model_id, plan_id] = params;
     importRequests[REQUEST_ID] = { model_id, plan_id, reason: null, requester, status };
@@ -415,6 +432,19 @@ describe('importPlan with an embedded model', () => {
     expect(Object.keys(stagedResults()).sort()).toEqual(['profiles', 'spans']);
   });
 
+  test.each([
+    ['P1D', 86_400_000_000],
+    ['1 month', 2_592_000_000_000],
+    ['1 year', 31_557_600_000_000],
+  ])('normalizes the plan interval %s through PostgreSQL', async (duration, expected) => {
+    const transfer = { ...v3Fixture, duration };
+
+    const { error } = await runImport(transfer);
+
+    expect(error).toBeUndefined();
+    expect(callsTo('InsertExternalSimulationDataset')[0].variables.simulationDuration).toBe(expected);
+  });
+
   test('writes each profile with type and schema before segments, keeping segment order', async () => {
     const transfer = structuredClone(v3Fixture);
     const [name, { schema, segments, type }] = Object.entries(transfer.results!.profiles)[0];
@@ -479,7 +509,7 @@ describe('importPlan refusing an embedded-model import before responding', () =>
 
     const { error, request } = await runImport(v3Fixture);
 
-    expect(error).toBe('Plan creation unsuccessful.');
+    expect(error).toBe('Uniqueness violation');
     expect(callsTo('DeletePlan')).toHaveLength(0);
     expect(callsTo('DeleteMissionModel')[0].variables).toEqual({ id: MODEL_ID });
     expect(removeUploadedFile).toHaveBeenCalledWith(MODEL_FILE);
@@ -532,6 +562,12 @@ describe('importPlan failing after responding', () => {
     expect(callsTo('DeletePlan')[0].variables).toEqual({ id: PLAN_ID });
     expect(callsTo('DeleteMissionModel')[0].variables).toEqual({ id: MODEL_ID });
     expect(callsTo('removeUploadedFile').at(-1)?.variables).toEqual(MODEL_FILE);
+
+    // as the requester's admin token, so a caller's token that expired mid-import can still be cleaned up after
+    for (const { headers } of [...callsTo('DeletePlan'), ...callsTo('DeleteTags')]) {
+      expect(headers?.['x-hasura-role']).toBe('admin');
+      expect(decodeJwt(headers?.Authorization).jwtPayload?.username).toBe('importer');
+    }
   }
 
   test('a failed type registration', async () => {
@@ -553,6 +589,26 @@ describe('importPlan failing after responding', () => {
     await expectFailedAndRolledBack(v3Fixture, 'plan cannot be marked read only');
     expect(callsTo('DeleteTags')[0].variables).toEqual({ tagIds: [FIRST_TAG_ID] });
     expect(callsTo('InsertExternalSimulationDataset')).toHaveLength(0);
+  });
+
+  test.each([
+    ['simulation arguments', 'InitialSimulationUpdate'],
+    ['activity anchors', 'UpdateActivityDirective'],
+    ['plan tags', 'CreatePlanTags'],
+  ])('a rejected %s write', async (_, operation) => {
+    responders[operation] = () => ({ errors: [{ message: `${operation} rejected` }] });
+
+    await expectFailedAndRolledBack(v3Fixture, `${operation} rejected`);
+    expect(callsTo('MarkPlanReadOnly')).toHaveLength(0);
+  });
+
+  test('an anchor update that affects no row', async () => {
+    responders.UpdateActivityDirective = ({ updates }) => ({
+      data: { update_activity_directive_many: updates.map(() => ({ affected_rows: 0 })) },
+    });
+
+    await expectFailedAndRolledBack(v3Fixture, 'Not all activity anchors were updated.');
+    expect(callsTo('MarkPlanReadOnly')).toHaveLength(0);
   });
 
   test('merlin refusing the results', async () => {
@@ -578,6 +634,17 @@ describe('importPlan failing after responding', () => {
   test('keeps the model when its plan could not be deleted', async () => {
     responders.MarkPlanReadOnly = () => merlinError('plan cannot be marked read only');
     responders.DeletePlan = () => ({ errors: [{ message: 'database unavailable' }] });
+
+    const { request } = await runImport(v3Fixture);
+
+    expect(request?.status).toBe('failed');
+    expect(callsTo('DeleteMissionModel')).toHaveLength(0);
+    expect(removeUploadedFile).not.toHaveBeenCalledWith(MODEL_FILE);
+  });
+
+  test('keeps the model when deleting the plan returns null', async () => {
+    responders.MarkPlanReadOnly = () => merlinError('plan cannot be marked read only');
+    responders.DeletePlan = () => ({ data: { deletePlan: null } });
 
     const { request } = await runImport(v3Fixture);
 
@@ -625,8 +692,18 @@ describe('importPlan calling the backend', () => {
     });
     expect(jwtPayload!.exp! - jwtPayload!.iat!).toBe(10);
 
-    // everything else still runs as the caller
+    // acceptance uses the caller's token; background writes use fresh gateway-owned tokens with the accepted role
     expect(callsTo('CreatePlan')[0].headers?.Authorization).toBe(`Bearer ${token}`);
+    for (const call of [
+      ...callsTo('ModelTypeRefreshStatus'),
+      ...callsTo('InitialSimulationUpdate'),
+      ...callsTo('UpdateActivityDirective'),
+      ...callsTo('CreatePlanTags'),
+    ]) {
+      expect(call.headers?.Authorization).not.toBe(`Bearer ${token}`);
+      expect(call.headers?.['x-hasura-role']).toBe('user');
+      expect(decodeJwt(call.headers?.Authorization).jwtPayload?.username).toBe('importer');
+    }
   });
 
   test('takes the requester from the token, not the x-hasura-user-id header', async () => {

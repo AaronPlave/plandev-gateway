@@ -6,7 +6,7 @@ import { DbMerlin } from '../db/db.js';
 import { removeUploadedFile, storeUploadedFile } from '../files/store.js';
 import { getEnv } from '../../env.js';
 import getLogger from '../../logger.js';
-import { intervalToMicroseconds, isoToDoyTimestamp } from '../../util/time.js';
+import { isoToDoyTimestamp } from '../../util/time.js';
 import gql from './gql.js';
 
 /**
@@ -83,13 +83,28 @@ export type CreatedNonExecutableModel = {
  * Headers for a short-lived admin token acting as `user`. Only admins may insert or delete models through Hasura; the
  * caller must already be known to be allowed to create plans.
  */
-function adminHeaders(user: string): Record<string, string> {
+export function adminHeaders(user: string): Record<string, string> {
   const adminToken = generateJwt(user, 'admin', ['admin'], '10s');
   if (adminToken === null) {
     throw new Error('Could not create a token to manage the non-executable model.');
   }
 
   return { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json', 'x-hasura-role': 'admin' };
+}
+
+/** Fresh gateway-owned credentials for background work, retaining the role authorized on the request. */
+export function backgroundHeaders(user: string, role: string): Record<string, string> {
+  const token = generateJwt(user, role, [role], '10s');
+  if (token === null) {
+    throw new Error('Could not create a token to continue the plan import.');
+  }
+
+  return {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    'x-hasura-role': role,
+    'x-hasura-user-id': user,
+  };
 }
 
 /**
@@ -147,7 +162,12 @@ export async function deleteNonExecutableModel({
   owner,
 }: CreatedNonExecutableModel): Promise<void> {
   try {
-    await postGraphQL(gql.DELETE_MISSION_MODEL, { id }, adminHeaders(owner));
+    const { delete_mission_model_by_pk: deleted } = await postGraphQL<{
+      delete_mission_model_by_pk: { id: number } | null;
+    }>(gql.DELETE_MISSION_MODEL, { id }, adminHeaders(owner));
+    if (deleted?.id !== id) {
+      throw new Error('Delete returned no model.');
+    }
   } catch (error) {
     // the model still references its definition file, so the file stays too
     logger.error(`Could not delete non-executable model ${id}: ${(error as Error).message}`);
@@ -181,14 +201,14 @@ type ModelTypeRefreshStatus = {
 /**
  * Waits until merlin has registered a new model's activity types, resource types and parameters.
  */
-export async function waitForModelTypes(modelId: number, headers: Record<string, string>): Promise<void> {
+export async function waitForModelTypes(modelId: number, getHeaders: () => Record<string, string>): Promise<void> {
   const deadline = Date.now() + MODEL_TYPE_REFRESH_TIMEOUT_MS;
 
   for (;;) {
     const { mission_model_by_pk: model } = await postGraphQL<ModelTypeRefreshStatus>(
       gql.MODEL_TYPE_REFRESH_STATUS,
       { modelId },
-      headers,
+      getHeaders(),
     );
     if (model == null) {
       throw new Error(`Model ${modelId} was not found while waiting for its types to be registered.`);
@@ -218,6 +238,19 @@ export async function waitForModelTypes(modelId: number, headers: Record<string,
 
     await new Promise(resolve => setTimeout(resolve, MODEL_TYPE_REFRESH_POLL_MS));
   }
+}
+
+/** Uses PostgreSQL's interval semantics, matching the value accepted for the plan duration column. */
+async function postgresIntervalToMicroseconds(interval: string): Promise<number> {
+  const { rows } = await DbMerlin.getDb().query(
+    'select round(extract(epoch from $1::interval) * 1000000)::text as microseconds;',
+    [interval],
+  );
+  const microseconds = Number(rows[0]?.microseconds);
+  if (!Number.isSafeInteger(microseconds)) {
+    throw new Error(`Plan duration cannot be represented in microseconds: ${interval}`);
+  }
+  return microseconds;
 }
 
 export type PlanImportRequestStatus =
@@ -270,7 +303,8 @@ export async function setPlanImportRequestStatus(
 }
 
 const IMPORT_REQUEST_POLL_MS = 1_000;
-// ponytail: a gateway restart mid-import leaves its request in progress; needs a sweep on startup if that matters
+// Recovery needs a durable worker lease/payload and the ids of every import-created record. A status-only startup
+// sweep cannot distinguish this process's abandoned work from another Gateway instance's live import.
 const IMPORT_REQUEST_TIMEOUT_MS = 3_600_000;
 
 /** Waits for merlin to mark an import request complete, and throws its reason if merlin marks it failed. */
@@ -355,7 +389,7 @@ export async function insertExternalSimulationDataset({
       resultsFileId: resultsFile.id,
       simulationArguments,
       // results either carry their own window or inherit the plan's
-      simulationDuration: results.duration ?? intervalToMicroseconds(planDuration),
+      simulationDuration: results.duration ?? (await postgresIntervalToMicroseconds(planDuration)),
       simulationStartTime: isoToDoyTimestamp(results.start_time ?? planStartTime),
     });
     await waitForPlanImportRequest(planImportRequestId);

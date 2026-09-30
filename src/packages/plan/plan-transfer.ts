@@ -87,9 +87,21 @@ export function parsePlanTransfer(input: unknown): PlanTransfer {
   }
 
   const transfer = migrated as PlanTransfer;
+  assertActivityIdsUnique(transfer);
   assertSpansConsistent(transfer);
 
   return transfer;
+}
+
+/** Activity ids are file-local keys used by anchors and result spans, so they must be unambiguous. */
+function assertActivityIdsUnique({ activities }: PlanTransfer): void {
+  const seen = new Set<number>();
+  for (const { id } of activities) {
+    if (seen.has(id)) {
+      throw new UnsupportedPlanTransferError(`Activity id ${id} is used more than once.`);
+    }
+    seen.add(id);
+  }
 }
 
 /**

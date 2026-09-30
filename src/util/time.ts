@@ -139,11 +139,6 @@ export function isoToDoyTimestamp(dateTime: string): string {
   )}${fraction}`;
 }
 
-/** Converts a Postgres interval (e.g. a plan's `duration`) to microseconds. */
-export function intervalToMicroseconds(interval: string): number {
-  return Math.round(getIntervalInMs(interval) * 1000);
-}
-
 export function convertDateToDoy(dateString: string, numDecimals = 6): string | null {
   const parsedTime = parseDoyOrYmdTime(dateString, numDecimals);
 
