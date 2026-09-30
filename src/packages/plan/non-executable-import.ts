@@ -2,6 +2,7 @@ import fetch from 'node-fetch';
 import type { HasuraError } from '../../types/hasura.js';
 import type { ModelDeclaration, SerializedValue, SimulationResultsTransfer } from '../../types/plan-transfer.js';
 import { generateJwt } from '../auth/functions.js';
+import { DbMerlin } from '../db/db.js';
 import { removeUploadedFile, storeUploadedFile } from '../files/store.js';
 import { getEnv } from '../../env.js';
 import getLogger from '../../logger.js';
@@ -13,8 +14,9 @@ import gql from './gql.js';
  *
  * The gateway creates the non-executable model's row through Hasura, whose event triggers then have merlin register
  * its types. Merlin owns the imported simulation dataset and the plan's read-only flag; the gateway stages files, says
- * who the caller is, and asks for the plan to be made read-only once it has finished writing to it. How each payload
- * reaches the backend is kept inside these helpers so it can change without touching `/importPlan`.
+ * who the caller is, and asks for the plan to be made read-only once it has finished writing to it. The import's
+ * progress is tracked in a `merlin.plan_import_request` row, which the gateway and merlin both advance. How each
+ * payload reaches the backend is kept inside these helpers so it can change without touching `/importPlan`.
  */
 
 const logger = getLogger('packages/plan/non-executable-import');
@@ -178,16 +180,11 @@ type ModelTypeRefreshStatus = {
 
 /**
  * Waits until merlin has registered a new model's activity types, resource types and parameters.
- * Stops polling once `signal` is aborted.
  */
-export async function waitForModelTypes(
-  modelId: number,
-  headers: Record<string, string>,
-  signal?: AbortSignal,
-): Promise<void> {
+export async function waitForModelTypes(modelId: number, headers: Record<string, string>): Promise<void> {
   const deadline = Date.now() + MODEL_TYPE_REFRESH_TIMEOUT_MS;
 
-  while (!signal?.aborted) {
+  for (;;) {
     const { mission_model_by_pk: model } = await postGraphQL<ModelTypeRefreshStatus>(
       gql.MODEL_TYPE_REFRESH_STATUS,
       { modelId },
@@ -223,19 +220,101 @@ export async function waitForModelTypes(
   }
 }
 
+export type PlanImportRequestStatus =
+  | 'complete'
+  | 'extracting_model'
+  | 'failed'
+  | 'importing_dataset'
+  | 'importing_plan';
+
+/** Why an import request failed, as stored in its `reason`. */
+type PlanImportRequestReason = { message?: string } & Record<string, unknown>;
+
 /**
- * Has merlin store `results` (if any) as a successful simulation dataset for the plan.
+ * Records a new import, whose (empty) plan exists, in its first status. Clients follow the import through this row.
+ * Written directly, like `merlin.uploaded_file`.
+ */
+export async function createPlanImportRequest({
+  modelId,
+  planId,
+  requester,
+  status,
+}: {
+  modelId: number;
+  planId: number;
+  requester: string;
+  status: PlanImportRequestStatus;
+}): Promise<number> {
+  const { rows } = await DbMerlin.getDb().query(
+    `
+      insert into merlin.plan_import_request (requester, status, model_id, plan_id)
+      values ($1, $2, $3, $4)
+      returning id;
+    `,
+    [requester, status, modelId, planId],
+  );
+
+  return rows[0].id;
+}
+
+export async function setPlanImportRequestStatus(
+  id: number,
+  status: PlanImportRequestStatus,
+  reason: PlanImportRequestReason | null = null,
+): Promise<void> {
+  await DbMerlin.getDb().query('update merlin.plan_import_request set status = $2, reason = $3 where id = $1;', [
+    id,
+    status,
+    reason,
+  ]);
+}
+
+const IMPORT_REQUEST_POLL_MS = 1_000;
+// ponytail: a gateway restart mid-import leaves its request in progress; needs a sweep on startup if that matters
+const IMPORT_REQUEST_TIMEOUT_MS = 3_600_000;
+
+/** Waits for merlin to mark an import request complete, and throws its reason if merlin marks it failed. */
+async function waitForPlanImportRequest(id: number): Promise<void> {
+  const deadline = Date.now() + IMPORT_REQUEST_TIMEOUT_MS;
+
+  for (;;) {
+    const { rows } = await DbMerlin.getDb().query(
+      'select status, reason from merlin.plan_import_request where id = $1;',
+      [id],
+    );
+    const [request] = rows as { reason: PlanImportRequestReason | null; status: PlanImportRequestStatus }[];
+
+    if (request === undefined) {
+      throw new Error(`Import request ${id} was not found while waiting for its results to be ingested.`);
+    }
+    if (request.status === 'complete') {
+      return;
+    }
+    if (request.status === 'failed') {
+      throw new Error(request.reason?.message ?? `Ingesting the results failed: ${JSON.stringify(request.reason)}`);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out after ${IMPORT_REQUEST_TIMEOUT_MS / 1000} s waiting for the results to be ingested.`);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, IMPORT_REQUEST_POLL_MS));
+  }
+}
+
+/**
+ * Has merlin store `results` as a successful simulation dataset for the plan, and waits until it has.
  *
- * Spans and profiles are staged as a file merlin reads
- * from the shared file store, and removed once merlin is done with them. The simulation's window and arguments go in
- * the call itself, so merlin has them before reading the file: timestamps in merlin's UTC day-of-year format, the
- * duration in microseconds.
+ * Spans and profiles are staged as a file merlin reads from the shared file store. Merlin accepts the request, ingests
+ * the file in the background and marks the import request complete or failed; the file is removed once it has. The
+ * simulation's window and arguments go in the call itself, so merlin has them before reading the file: timestamps in
+ * merlin's UTC day-of-year format, the duration in microseconds.
  *
  * `results` must already reference the plan's directive ids (see `remapResultDirectiveIds`).
  */
 export async function insertExternalSimulationDataset({
   planDuration,
   planId,
+  planImportRequestId,
   planStartTime,
   requester,
   results,
@@ -244,45 +323,44 @@ export async function insertExternalSimulationDataset({
   /** A Postgres interval, as on the plan. */
   planDuration: string;
   planId: number;
+  planImportRequestId: number;
   /** ISO 8601, as on the plan. */
   planStartTime: string;
   /** The user from the caller's verified token. */
   requester: string;
-  results: SimulationResultsTransfer | undefined;
+  results: SimulationResultsTransfer;
   simulationArguments: Record<string, SerializedValue>;
 }): Promise<void> {
-  const resultsFile =
-    results &&
-    (await storeUploadedFile(
-      'plan-transfer-results.json',
-      JSON.stringify({
-        // merlin streams each profile once, so it needs `type` and `schema` before `segments`
-        profiles: Object.fromEntries(
-          Object.entries(results.profiles).map(([name, { type, schema, segments }]) => [
-            name,
-            // eslint-disable-next-line sort-keys -- key order is what merlin's parser needs
-            { type, schema, segments },
-          ]),
-        ),
-        spans: results.spans,
-      }),
-    ));
+  const resultsFile = await storeUploadedFile(
+    'plan-transfer-results.json',
+    JSON.stringify({
+      // merlin streams each profile once, so it needs `type` and `schema` before `segments`
+      profiles: Object.fromEntries(
+        Object.entries(results.profiles).map(([name, { type, schema, segments }]) => [
+          name,
+          // eslint-disable-next-line sort-keys -- key order is what merlin's parser needs
+          { type, schema, segments },
+        ]),
+      ),
+      spans: results.spans,
+    }),
+  );
 
   try {
     await postMerlin('insertExternalSimulationDataset', {
       planId,
       planStartTime: isoToDoyTimestamp(planStartTime),
+      requestId: planImportRequestId,
       requester,
-      resultsFileId: resultsFile?.id ?? null,
+      resultsFileId: resultsFile.id,
       simulationArguments,
       // results either carry their own window or inherit the plan's
-      simulationDuration: results?.duration ?? intervalToMicroseconds(planDuration),
-      simulationStartTime: isoToDoyTimestamp(results?.start_time ?? planStartTime),
+      simulationDuration: results.duration ?? intervalToMicroseconds(planDuration),
+      simulationStartTime: isoToDoyTimestamp(results.start_time ?? planStartTime),
     });
+    await waitForPlanImportRequest(planImportRequestId);
   } finally {
-    if (resultsFile) {
-      await removeUploadedFile(resultsFile);
-    }
+    await removeUploadedFile(resultsFile);
   }
 }
 
