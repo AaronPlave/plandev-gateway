@@ -153,14 +153,18 @@ async function readChunks(
   edgesOnly: boolean,
   maxSamples: number | null = null,
 ): Promise<Map<number, ChunkRow[]>> {
-  // With maxSamples, only the leading chunks that hold the first maxSamples + 1 samples: enough for a page and
-  // its `next`, without reading (or detoasting) the rest of a years-wide exact window.
+  // With maxSamples, only the leading chunks that hold the first maxSamples + 1 in-window samples: enough for a
+  // page and its `next`, without reading (or detoasting) the rest of a years-wide exact window. The first chunk
+  // may begin before `start`, so it is not counted; every later one lies wholly inside. A chunk never splits a
+  // timestamp, so a run of equal times is always whole, and the chunk after it is read too.
   const inside = edgesOnly
     ? `(select ${CHUNK_COLUMNS} from merlin.source_chunk c
          where c.revision_id = $1 and c.resource_id = r.id and c.t1 >= $3 order by c.t1 limit 1)`
     : maxSamples !== null
     ? `(select ${CHUNK_COLUMNS} from (
-           select c.*, sum(c.n) over (order by c.t1) - c.n as preceding from merlin.source_chunk c
+           select c.*, sum(c.n) over (order by c.t1 rows unbounded preceding) - first_value(c.n) over (order by c.t1)
+                       - c.n as preceding
+             from merlin.source_chunk c
             where c.revision_id = $1 and c.resource_id = r.id and c.t1 >= $3 and c.t1 < $4) c
           where c.preceding <= $5)`
     : `(select ${CHUNK_COLUMNS} from merlin.source_chunk c
@@ -209,7 +213,9 @@ async function countSamples(pool: Pool, revisionId: number, ids: number[], start
 }
 
 type SummaryDbRow = {
-  changes: number;
+  change_kind: number | null;
+  change_s: string | null;
+  change_t: string | null;
   first_kind: number;
   first_s: string | null;
   first_t: string;
@@ -223,6 +229,8 @@ type SummaryDbRow = {
   min_t: string | null;
   min_v: number | null;
   n: number;
+  nonvalue_kind: number | null;
+  nonvalue_t: string | null;
   resource_id: number;
 };
 
@@ -235,7 +243,8 @@ async function readSummaries(
 ): Promise<Map<number, SummaryRow[]>> {
   const { rows } = await pool.query<SummaryDbRow>(
     `select q.id as resource_id, s.n, s.first_t, s.last_t, s.first_kind, s.last_kind, s.min_t, s.max_t,
-            s.first_v, s.last_v, s.min_v, s.max_v, s.first_s, s.last_s, s.changes
+            s.first_v, s.last_v, s.min_v, s.max_v, s.first_s, s.last_s,
+            s.nonvalue_t, s.nonvalue_kind, s.change_t, s.change_kind, s.change_s
        from unnest($2::int[], $3::smallint[], $4::bigint[], $5::bigint[]) as q(id, level, b0, b1)
        cross join lateral (
          select * from merlin.source_summary s
@@ -255,7 +264,9 @@ async function readSummaries(
   for (const row of rows) {
     const list = byResource.get(row.resource_id) ?? [];
     list.push({
-      changes: row.changes,
+      changeKind: row.change_kind,
+      changeS: row.change_s,
+      changeT: row.change_t === null ? null : Number(row.change_t),
       firstKind: row.first_kind,
       firstS: row.first_s,
       firstT: Number(row.first_t),
@@ -269,6 +280,8 @@ async function readSummaries(
       minT: row.min_t === null ? null : Number(row.min_t),
       minV: row.min_v,
       n: row.n,
+      nonValueKind: row.nonvalue_kind,
+      nonValueT: row.nonvalue_t === null ? null : Number(row.nonvalue_t),
     });
     byResource.set(row.resource_id, list);
   }

@@ -26,7 +26,8 @@ const gzipAsync = promisify(gzip);
  * can be drawn continuously across it.
  *
  * Who may read what is decided by Hasura: the revision is resolved with the caller's own token, so a caller
- * can query exactly the revisions they can see.
+ * can query exactly the revisions they can see. Today that is every revision, for every role, as with plans,
+ * simulation datasets and external sources: PlanDev's data is readable by all of its users.
  */
 
 type Body = {
@@ -55,8 +56,9 @@ const PROVIDERS: Record<
   pg_chunks_v1: (revisionId, resources, query) => queryPgChunks(DbMerlin.getDb(), revisionId, resources, query),
 };
 
-// ponytail: per-process caches, unbounded by count but tiny (a catalog is a few hundred KB). Add an LRU if a
-// gateway ever serves many thousands of revisions.
+// ponytail: per-process caches. A catalog is a few hundred KB; add an LRU if a gateway ever serves many thousands
+// of revisions. Auth entries hold a token, so expired ones are swept rather than left to accumulate.
+const AUTH_CACHE_SWEEP_SIZE = 1000;
 const authCache = new Map<string, { expires: number; revision: Revision | null }>();
 const catalogCache = new Map<number, Map<string, CatalogResource>>();
 
@@ -92,6 +94,10 @@ async function resolveRevision(req: Request, planSourceId: number | null, revisi
     planSourceId !== null
       ? json.data?.plan_source_by_pk?.source_revision ?? null
       : json.data?.source_revision_by_pk ?? null;
+  if (authCache.size >= AUTH_CACHE_SWEEP_SIZE) {
+    const now = Date.now();
+    authCache.forEach((entry, key) => entry.expires <= now && authCache.delete(key));
+  }
   authCache.set(cacheKey, { expires: Date.now() + AUTH_TTL_MS, revision });
   return revision;
 }

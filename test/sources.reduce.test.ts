@@ -2,10 +2,12 @@ import { describe, expect, test } from 'vitest';
 import {
   capExact,
   GAP,
+  NULL,
   reduceDiscrete,
   reduceNumeric,
   summaryComponents,
   type Series,
+  type SummaryRow,
 } from '../src/packages/sources/reduce';
 
 function wave(n: number): Series {
@@ -52,6 +54,22 @@ describe('reduceDiscrete', () => {
     expect(reduceDiscrete(series, 0, 7, 10)).toEqual({ s: ['A', 'B', 'A', 'C'], t: [0, 2, 4, 5] });
   });
 
+  test('a state, null or gap narrower than a bucket still shows', () => {
+    // 100 buckets of 100 samples, every one busy except one that holds A, then briefly B and a gap, then A.
+    const n = 10_000;
+    const s: (string | null)[] = Array.from({ length: n }, (_, i) =>
+      i >= 5000 && i < 5100 ? 'A' : i % 2 ? 'ON' : 'OFF',
+    );
+    const k = s.map(() => 0);
+    s[5010] = 'B';
+    s[5011] = null;
+    k[5011] = GAP;
+    const out = reduceDiscrete({ k, s, t: [...Array(n).keys()] }, 0, n, 400);
+    expect(out.t.length).toBeLessThanOrEqual(400);
+    expect(out.s).toContain('B');
+    expect(out.k?.filter(kind => kind === GAP)).toHaveLength(1);
+  });
+
   test('with too many transitions, stays within budget and keeps changes narrower than a bucket', () => {
     const n = 10_000;
     const series: Series = { s: Array.from({ length: n }, (_, i) => (i % 2 ? 'ON' : 'OFF')), t: [...Array(n).keys()] };
@@ -62,30 +80,56 @@ describe('reduceDiscrete', () => {
 });
 
 describe('summaryComponents', () => {
+  const row = (r: Partial<SummaryRow>): SummaryRow => ({
+    changeKind: null,
+    changeS: null,
+    changeT: null,
+    firstKind: 0,
+    firstS: null,
+    firstT: 0,
+    firstV: null,
+    lastKind: 0,
+    lastS: null,
+    lastT: 9,
+    lastV: null,
+    maxT: null,
+    maxV: null,
+    minT: null,
+    minV: null,
+    n: 10,
+    nonValueKind: null,
+    nonValueT: null,
+    ...r,
+  });
+
   test('emits first, min, max, last of each bucket in time order', () => {
-    const out = summaryComponents(
-      [
-        {
-          changes: 4,
-          firstKind: 0,
-          firstS: null,
-          firstT: 0,
-          firstV: 1,
-          lastKind: 0,
-          lastS: null,
-          lastT: 9,
-          lastV: 2,
-          maxT: 2,
-          maxV: 8,
-          minT: 7,
-          minV: -3,
-          n: 10,
-        },
-      ],
-      true,
-    );
+    const out = summaryComponents([row({ firstV: 1, lastV: 2, maxT: 2, maxV: 8, minT: 7, minV: -3 })], true);
     expect(out.t).toEqual([0, 2, 7, 9]);
     expect(out.v).toEqual([1, 8, -3, 2]);
+  });
+
+  test('a gap or null inside a bucket whose value never changes still breaks the line', () => {
+    for (const kind of [GAP, NULL]) {
+      const out = summaryComponents(
+        [row({ firstV: 10, lastV: 10, maxT: 0, maxV: 10, minT: 0, minV: 10, nonValueKind: kind, nonValueT: 5 })],
+        true,
+      );
+      expect(out.t).toEqual([0, 5, 9]);
+      expect(out.v).toEqual([10, null, 10]);
+      expect(out.k).toEqual([0, kind, 0]);
+    }
+  });
+
+  test('a state held briefly inside a bucket that starts and ends in the same state still shows', () => {
+    const out = summaryComponents([row({ changeKind: 0, changeS: 'B', changeT: 4, firstS: 'A', lastS: 'A' })], false);
+    expect(out.s).toEqual(['A', 'B', 'A']);
+    expect(out.t).toEqual([0, 4, 9]);
+    const gap = summaryComponents(
+      [row({ changeKind: 0, changeS: 'B', changeT: 4, firstS: 'A', lastS: 'A', nonValueKind: GAP, nonValueT: 5 })],
+      false,
+    );
+    expect(gap.s).toEqual(['A', 'B', null, 'A']);
+    expect(gap.k).toEqual([0, 0, GAP, 0]);
   });
 });
 
