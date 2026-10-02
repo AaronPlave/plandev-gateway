@@ -1,5 +1,6 @@
 import type { Express, Request, Response } from 'express';
 import fetch from 'node-fetch';
+import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { gzip } from 'node:zlib';
 import { getEnv } from '../../env.js';
@@ -57,15 +58,16 @@ const PROVIDERS: Record<
 };
 
 // ponytail: per-process caches. A catalog is a few hundred KB; add an LRU if a gateway ever serves many thousands
-// of revisions. Auth entries hold a token, so expired ones are swept rather than left to accumulate.
+// of revisions. Auth entries are keyed by a digest of the token, never the token; expired ones are swept.
 const AUTH_CACHE_SWEEP_SIZE = 1000;
 const authCache = new Map<string, { expires: number; revision: Revision | null }>();
 const catalogCache = new Map<number, Map<string, CatalogResource>>();
 
-async function resolveRevision(req: Request, planSourceId: number | null, revisionId: number | null) {
+export async function resolveRevision(req: Request, planSourceId: number | null, revisionId: number | null) {
   const authorization = req.get('authorization') ?? '';
   const role = req.get('x-hasura-role') ?? '';
-  const cacheKey = `${authorization}|${role}|${planSourceId}|${revisionId}`;
+  const session = createHash('sha256').update(authorization).digest('base64');
+  const cacheKey = `${session}|${role}|${planSourceId}|${revisionId}`;
   const cached = authCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) {
     return cached.revision;

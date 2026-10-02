@@ -108,7 +108,7 @@ function bucketOf(t: number, start: number, end: number, buckets: number): numbe
  * Reduces numeric samples in [start, end) to at most `pointBudget` points. Returns the series unchanged when
  * it already fits. Every point returned is a real sample.
  *  - m4: per bucket the first, minimum, maximum and last sample (a line through them draws the same pixels as
- *    a line through every sample), plus a null/gap if the bucket has one, so the line breaks there too;
+ *    a line through every sample), plus its first null/gap, so the line breaks there too;
  *  - minmax: per bucket the minimum and maximum, plus a null/gap;
  *  - nth: every k-th sample.
  */
@@ -192,9 +192,10 @@ function transitionIndices(series: Series, indices: number[]): number[] {
 
 /**
  * Reduces discrete samples in [start, end) to at most `pointBudget` points, preserving state transitions.
- * Repeated samples of an unchanged state are dropped first; that alone is lossless for drawing. If there are
+ * Repeated samples of an unchanged state are dropped first; that alone changes nothing drawn. If there are
  * still too many transitions, each bucket keeps its first and second transitions, its first null/gap and the
- * state it ends in: a state held more briefly than a bucket (A, B, A) and a gap inside one both still show.
+ * state it ends in: a state held more briefly than a bucket (A, B, A) and a gap inside one both still show,
+ * but further events in the same bucket may not.
  */
 export function reduceDiscrete(series: Series, start: number, end: number, pointBudget: number): Series {
   const all = series.t.map((_, i) => i);
@@ -236,8 +237,9 @@ export function reduceDiscrete(series: Series, start: number, end: number, point
 /**
  * The real samples a run of summary buckets records, in time order: for each bucket its first and last sample,
  * its minimum and maximum (numeric), its first change of state (discrete) and its first null or gap. Reducing
- * these reduces the data they summarize to within one summary bucket at each output bucket boundary, and keeps
- * every bucket's gaps, nulls and brief states visible.
+ * these approximates reducing the data they summarize, to within one summary bucket at each output bucket
+ * boundary. One break and one brief state per bucket stay visible; further events in a bucket may be omitted,
+ * and exact queries remain authoritative.
  */
 export function summaryComponents(rows: SummaryRow[], numeric: boolean): Series {
   const t: number[] = [];
